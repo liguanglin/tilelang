@@ -420,15 +420,16 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
                                  "Ascend L1->L0 destination");
     CheckCompactL0Region(op.dst, dst_range, analyzer,
                          "Ascend L1->L0 compact destination");
-    // M/K positions go through intrinsic args; leading dims (e.g. version)
-    // through the pointer offset.
+    // Source M/K positions go through intrinsic args; the destination starts
+    // at zero within its matrix. Both pointers keep only leading dimensions
+    // (e.g. version).
     // Keep the Buffer identity until layout remapping. A raw data Var cannot
     // distinguish views with different dtypes/layouts on the same storage.
     auto make_view_ptr = [&](const Buffer &buffer, const Array<Range> &ranges,
-                             int access, bool leading_only) {
+                             int access) {
       Array<PrimExpr> indices;
       for (size_t i = 0; i < ranges.size(); ++i) {
-        indices.push_back(leading_only && i + 2 >= ranges.size()
+        indices.push_back(i + 2 >= ranges.size()
                               ? make_zero(ranges[i]->min.dtype())
                               : ranges[i]->min);
       }
@@ -437,8 +438,8 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
       return Call(DataType::Handle(), tl::access_ptr(),
                   {BufferLoad(buffer, indices), extent, I(access)});
     };
-    PrimExpr src_base_ptr = make_view_ptr(op.src, src_range, 1, true);
-    dst_ptr = make_view_ptr(op.dst, dst_range, 2, false);
+    PrimExpr src_base_ptr = make_view_ptr(op.src, src_range, 1);
+    dst_ptr = make_view_ptr(op.dst, dst_range, 2);
 
     AscendFractalLayoutInfo src_info;
     AscendFractalLayoutInfo dst_info;
