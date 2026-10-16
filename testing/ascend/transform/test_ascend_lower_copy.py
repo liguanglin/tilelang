@@ -376,3 +376,48 @@ def test_dynamic_sf_copy_requires_proven_data_capacity(axis, lower_bound, upper_
     (load,) = calls(lower(), "tl.ascend_load_ca_sf")
     if lower_bound <= upper_bound:
         _equal(load.args[4:6], [tirx.floordiv(n + 15, 16), 1] if axis == "mn" else [1, n])
+
+
+@pytest.mark.parametrize("scope", ["shared.l0a", "shared.l0b"])
+@pytest.mark.parametrize("base_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("stage", [0, 1])
+def test_l1_to_l0_views_preserve_version_byte_offsets(scope, base_dtype, stage):
+    from testing.ascend._ir import copy, kernel, seq
+
+    # Both views occupy 8 KiB per version, but use different element widths
+    # and fractal layouts. The allocation must not determine a view's offset.
+    storage = tirx.decl_buffer((2, 32, 128 if base_dtype == "bfloat16" else 64), base_dtype, name="storage", scope=scope)
+    bf16_view = tirx.decl_buffer((2, 32, 128), "bfloat16", name="bf16_view", data=storage.data)
+    fp32_view = tirx.decl_buffer((2, 32, 64), "float32", name="fp32_view", data=storage.data)
+    source_storage = tirx.decl_buffer(storage.shape, base_dtype, name="source_storage", scope="shared.l1")
+    bf16_src = tirx.decl_buffer((2, 32, 128), "bfloat16", name="bf16_src", data=source_storage.data)
+    fp32_src = tirx.decl_buffer((2, 32, 64), "float32", name="fp32_src", data=source_storage.data)
+    layouts = {
+        storage: make_ascend_major_mn_layout(storage) if base_dtype == "bfloat16" else make_ascend_major_k_layout(storage),
+        source_storage: make_ascend_nz_layout(source_storage),
+        bf16_view: make_ascend_major_mn_layout(bf16_view),
+        fp32_view: make_ascend_major_k_layout(fp32_view),
+        bf16_src: make_ascend_nz_layout(bf16_src),
+        fp32_src: make_ascend_nz_layout(fp32_src),
+    }
+    copies = [
+        copy(src, dst, src_indices=[stage, 0, 0], dst_indices=[stage, 0, 0], src_shape=[1, *src.shape[-2:]], dst_shape=[1, *dst.shape[-2:]])
+        for src, dst in [(bf16_src, bf16_view), (fp32_src, fp32_view)]
+    ]
+    before = kernel(seq(*copies), buffers=[storage, source_storage], annotations={"layout_map": layouts})
+    with tvm.target.Target("ascend"):
+        after = transform.AscendLowerTileOp()(before)
+
+    def byte_offset(ptr):
+        if ptr.op.name == "tirx.tvm_access_ptr":
+            return ptr.args[2] * (tvm.DataType(ptr.args[0].dtype).bits // 8)
+        load = ptr.args[0]
+        offset = 0
+        for index, extent in zip(load.indices, load.buffer.shape):
+            offset = offset * extent + index
+        return offset * (tvm.DataType(load.buffer.dtype).bits // 8)
+
+    loads = calls(after, "tl.ascend_load_cbuf_to_ca" if scope.endswith("a") else "tl.ascend_load_cbuf_to_cb")
+    assert len(loads) == 2
+    for load in loads:
+        _equal([byte_offset(load.args[0]), byte_offset(load.args[1])], [stage * 8192, stage * 8192])

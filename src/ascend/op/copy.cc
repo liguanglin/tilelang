@@ -422,8 +422,23 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
                          "Ascend L1->L0 compact destination");
     // M/K positions go through intrinsic args; leading dims (e.g. version)
     // through the pointer offset.
-    PrimExpr src_base_ptr =
-        MakeAscendLeadingDimAccessPtr(BufferRegion(op.src, src_range), 1);
+    // Keep the Buffer identity until layout remapping. A raw data Var cannot
+    // distinguish views with different dtypes/layouts on the same storage.
+    auto make_view_ptr = [&](const Buffer &buffer, const Array<Range> &ranges,
+                             int access, bool leading_only) {
+      Array<PrimExpr> indices;
+      for (size_t i = 0; i < ranges.size(); ++i) {
+        indices.push_back(leading_only && i + 2 >= ranges.size()
+                              ? make_zero(ranges[i]->min.dtype())
+                              : ranges[i]->min);
+      }
+      PrimExpr extent =
+          ranges[ranges.size() - 2]->extent * ranges.back()->extent;
+      return Call(DataType::Handle(), tl::access_ptr(),
+                  {BufferLoad(buffer, indices), extent, I(access)});
+    };
+    PrimExpr src_base_ptr = make_view_ptr(op.src, src_range, 1, true);
+    dst_ptr = make_view_ptr(op.dst, dst_range, 2, false);
 
     AscendFractalLayoutInfo src_info;
     AscendFractalLayoutInfo dst_info;

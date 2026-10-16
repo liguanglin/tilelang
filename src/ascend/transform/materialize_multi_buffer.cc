@@ -354,30 +354,6 @@ Layout ExpandLayoutToBuffer(const Buffer &layout_buffer,
   return layout->Expand(leading_shape);
 }
 
-Layout FindLayoutForBuffer(const Map<Buffer, Layout> &layout_map,
-                           const Buffer &buffer) {
-  if (layout_map.count(buffer))
-    return layout_map[buffer];
-  for (const auto &[layout_buffer, layout] : layout_map) {
-    if (layout_buffer->data.same_as(buffer->data)) {
-      Layout expanded = ExpandLayoutToBuffer(layout_buffer, buffer, layout);
-      if (expanded.defined())
-        return expanded;
-    }
-  }
-  return Layout();
-}
-
-bool AddLayoutForBuffer(Map<Buffer, Layout> *layout_map, const Buffer &buffer) {
-  if (layout_map->count(buffer))
-    return false;
-  Layout layout = FindLayoutForBuffer(*layout_map, buffer);
-  if (!layout.defined())
-    return false;
-  layout_map->Set(buffer, layout);
-  return true;
-}
-
 class AllocationRewriter : public StmtMutator {
 public:
   explicit AllocationRewriter(VersionedBufferRegistry *buffers)
@@ -405,9 +381,19 @@ private:
     bool layout_changed = false;
     if (auto value = op->annotations.Get(attr::kLayoutMap)) {
       if (auto layout_map = value.value().as<Map<Buffer, Layout>>()) {
-        Map<Buffer, Layout> rewritten_layouts = layout_map.value();
-        for (const Buffer &buffer : alloc_buffers)
-          layout_changed |= AddLayoutForBuffer(&rewritten_layouts, buffer);
+        Map<Buffer, Layout> rewritten_layouts;
+        // Expanded views keep their own layout, even when another view of
+        // the same storage has a different dtype or physical layout.
+        for (const auto &[buffer, layout] : layout_map.value()) {
+          Buffer rewritten = buffers_->Resolve(buffer);
+          if (!rewritten.same_as(buffer)) {
+            rewritten_layouts.Set(
+                rewritten, ExpandLayoutToBuffer(buffer, rewritten, layout));
+            layout_changed = true;
+          } else {
+            rewritten_layouts.Set(buffer, layout);
+          }
+        }
         if (layout_changed)
           annotations.Set(attr::kLayoutMap, rewritten_layouts);
       }

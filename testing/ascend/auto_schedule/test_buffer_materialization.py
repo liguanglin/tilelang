@@ -250,3 +250,37 @@ def test_bound_data_and_sf_preserve_user_leading_dimensions_under_one_ring():
     for store in stores:
         assert tvm.arith.Analyzer().can_prove_equal(store.indices[0], i % 2)
         assert [int(x) for x in store.indices[1:]] == [1, 2, 0, 0]
+
+
+@pytest.mark.parametrize("base_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("annotate_storage", [False, True])
+def test_versioned_views_keep_their_own_physical_layout(base_dtype, annotate_storage):
+    from tilelang.layout import make_ascend_major_k_layout, make_ascend_major_mn_layout
+
+    base = tirx.decl_buffer((32, 128 if base_dtype == "bfloat16" else 64), base_dtype, name="storage", scope="shared.l0b")
+    post = tirx.decl_buffer((32, 128), "bfloat16", name="post", data=base.data)
+    fn = tirx.decl_buffer((32, 64), "float32", name="fn", data=base.data)
+    layouts = {post: make_ascend_major_mn_layout(post), fn: make_ascend_major_k_layout(fn)}
+    if annotate_storage:
+        layouts[base] = make_ascend_major_mn_layout(base) if base_dtype == "bfloat16" else make_ascend_major_k_layout(base)
+    i = tirx.Var("i", "int32")
+    owner = tirx.For(
+        i,
+        0,
+        4,
+        tirx.ForKind.SERIAL,
+        seq(*[unit(tirx.BufferStore(buf, tirx.const(1, buf.dtype), [0, 0]), core=2) for buf in (post, fn)]),
+        annotations={"multi_buffer_eligible": [base.data]},
+    )
+    before = kernel(unit(owner, core=None), buffers=[base], annotations={"tl.buffer_versions_map": {base.data: 2}, "layout_map": layouts})
+    after = transform.MaterializeMultiBuffer()(before)
+    root = next(block for block in nodes(after, tirx.SBlock) if block.name_hint == "tilelang_root")
+    rewritten = root.annotations["layout_map"]
+    allocation = allocated_buffer(after, "storage")
+    assert (allocation in rewritten) == annotate_storage
+    if annotate_storage:
+        assert rewritten[allocation].is_equal(layouts[base].expand([2]))
+    for store, original in zip(nodes(after, tirx.BufferStore), (post, fn)):
+        assert store.buffer in rewritten
+        assert rewritten[store.buffer].is_equal(layouts[original].expand([2]))
+        assert int(store.buffer.strides[0]) * tvm.DataType(store.buffer.dtype).bits // 8 == 8192
